@@ -20,16 +20,24 @@ in RFC2516 (FCS Alternatives, Address-and-Control-Field-Compression
 and Asynchronous-Control-Character-Map) it is relying on the client to
 Nak these requests. This appears to work in practice!
 
+Dependencies
+------------
+
+Requires python 3.8, for some of the type annotations.
+
+Requires [pyserial](https://pypi.org/project/pyserial/) and
+[netifaces](https://pypi.org/project/netifaces/).
+
+If a chatscript is required to get the modem ready to talk ppp, `chat`
+must be installed in `/usr/sbin/chat`. On Debian-derived distributions
+this is provided by the `ppp` package.
+
 Running
 -------
 
 The program needs to be run with sufficient privilege to open raw
 Ethernet sockets (CAP_NET_RAW), and of course must also have
 permission to open the serial device.
-
-If a chatscript is required to get the modem ready to talk ppp, `chat`
-must be installed in `/usr/sbin/chat`. On Debian-derived distributions
-this is provided by the `ppp` package.
 
 Run as:
 ```
@@ -77,6 +85,18 @@ yet. If implemented, the command line would have to become a lot more
 complicated or a config file would have to be supported.
 
 Logging is very basic and only to stdout for now.
+
+Contributing
+------------
+
+All contributions are welcome. See [the project at
+github](https://github.com/sde1000/pppoe-serial-bridge) for issue
+tracker and pull requests.
+
+Please ensure that the program continues to pass
+[flake8](https://pypi.org/project/flake8/) and [mypy
+--strict](https://github.com/python/mypy) before creating a pull
+request.
 
 Copying
 -------
