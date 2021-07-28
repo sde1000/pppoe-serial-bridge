@@ -463,7 +463,8 @@ class AC:
             return
         if requested_service:
             # Filter service list by service name
-            services = [x for x in services if x.name == requested_service]
+            services = [x for x in self.services
+                        if x.name == requested_service]
         else:
             services = list(self.services)
 
