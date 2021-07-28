@@ -100,8 +100,7 @@ MacAddr = NewType('MacAddr', bytes)
 
 
 def macaddr_to_str(m: MacAddr) -> str:
-    # bytes.hex() with arguments isn't in typeshed yet
-    return m.hex(":")  # type: ignore
+    return m.hex(":")
 
 
 def str_to_macaddr(s: str) -> MacAddr:
