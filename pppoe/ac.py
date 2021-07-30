@@ -187,6 +187,8 @@ class AC:
         sel.register(self.s_session, selectors.EVENT_READ, self.read_session)
         self.sessions: Dict[int, Service] = {}
         self.session_number = self._session_number_generator()
+        # MTU of the interface; read with SIOCGIFMTU?
+        self.mtu = 1500
 
     def _session_number_generator(self) -> Generator[int, None, None]:
         """Generate valid unused session numbers
@@ -401,10 +403,12 @@ class AC:
 
     def send_session(self, peer: MacAddr, session_id: int,
                      payload: bytes) -> None:
+        if len(payload) > self.mtu:
+            return
         frame = b''.join((self.eth_header.pack(
             peer, self.mac, PPPOE_SESSION, VERTYPE, 0,
             session_id, len(payload)), payload))
-        self.s_discovery.send(frame)
+        self.s_session.send(frame)
 
     def close_session(self, peer: MacAddr, session_id: int,
                       error_message: Optional[str] = None) -> None:
