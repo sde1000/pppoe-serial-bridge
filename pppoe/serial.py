@@ -103,11 +103,15 @@ class SerialService(Service):
         frame = frame + fcs16(frame)
         frame = bytes(ppp_stuff(frame))
         frame = ppp_flag_sequence + frame + ppp_flag_sequence
+        # serial.Serial.write() appears to busy-wait until it can
+        # write to the device, which is particularly unhelpful because
+        # it pegs the CPU at 100%. Let's use os.write() on the fd
+        # instead.
         try:
-            self._f.write(frame)
-        except serial.SerialTimeoutException:
-            self.log.warning(f"Service {self.name}: Write to modem "
-                             "would have blocked; discarding frame")
+            os.write(self._f.fileno(), frame)
+        except BlockingIOError:
+            # Should we keep a statistics counter for this?
+            pass
 
     def read_from_modem(self, mask: int) -> None:
         # The behaviour of serial.Serial.read() is very unhelpful when
