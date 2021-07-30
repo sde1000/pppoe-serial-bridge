@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from setuptools import setup  # type: ignore
+from Cython.Build import cythonize  # type: ignore
 
 setup(name='pppoe',
       version='0.1',
@@ -29,4 +30,6 @@ setup(name='pppoe',
           'pyserial',
       ],
       include_package_data=True,
+      ext_modules=cythonize("pppoe/*.pyx",
+                            compiler_directives={'language_level': '3'}),
       zip_safe=False)
