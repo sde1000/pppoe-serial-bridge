@@ -83,7 +83,7 @@ def tags_to_payload(tags: Tags) -> bytes:
                     for tag_type, value in flatten(tags))
 
 
-def parse_payload(payload: bytes) -> Generator[Tag, None, None]:
+def parse_payload(payload: memoryview) -> Generator[Tag, None, None]:
     # Parse the payload one tag at a time, yielding (tag_type, value)
     # Raise ValueError if payload isn't valid
     # Stop if tag type End-Of-List is encountered
@@ -96,7 +96,7 @@ def parse_payload(payload: bytes) -> Generator[Tag, None, None]:
         if len(payload) < value_size:
             raise ValueError(f"Fewer than {value_size} bytes available "
                              "in payload while reading tag value")
-        value = payload[:value_size]
+        value = payload[:value_size].tobytes()
         payload = payload[value_size:]
         if tag_type == 0x0000:
             if value_size == 0:
@@ -106,7 +106,7 @@ def parse_payload(payload: bytes) -> Generator[Tag, None, None]:
         yield tag_type, value
 
 
-def payload_to_tags(payload: bytes) -> Tags:
+def payload_to_tags(payload: memoryview) -> Tags:
     # Convert payload to dict(tag_type: list of tag values)
     tags: Tags = {}
     for tag_type, value in parse_payload(payload):
@@ -173,6 +173,10 @@ class AC:
         addrs = netifaces.ifaddresses(interface)[netifaces.AF_PACKET]
         self.mac = str_to_macaddr(addrs[0]['addr'])
 
+        # Buffer for receiving packets
+        self.buf = bytearray(2048)
+        self.buf_mem = memoryview(self.buf)
+
         # Open the interface and bind to the discovery and session ethertypes
         self.s_discovery = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                          socket.htons(PPPOE_DISCOVERY))
@@ -185,6 +189,7 @@ class AC:
         self.s_session.bind((interface, 0))
         self.s_session.setblocking(False)
         sel.register(self.s_session, selectors.EVENT_READ, self.read_session)
+
         self.sessions: Dict[int, Service] = {}
         self.session_number = self._session_number_generator()
         # MTU of the interface; read with SIOCGIFMTU?
@@ -202,11 +207,11 @@ class AC:
                 i = 0x0001
 
     def read_discovery(self, mask: int) -> None:
-        frame = self.s_discovery.recv(2048)
-        if len(frame) < self.eth_header.size:
+        framesize = self.s_discovery.recv_into(self.buf)
+        if framesize < self.eth_header.size:
             return
         dest, src, etype, vt, code, session_id, payload_length \
-            = self.eth_header.unpack(frame[:self.eth_header.size])
+            = self.eth_header.unpack_from(self.buf)
         dest = MacAddr(dest)
         src = MacAddr(src)
         if etype != PPPOE_DISCOVERY:
@@ -215,7 +220,7 @@ class AC:
         if vt != VERTYPE:
             self.log.debug("Discovery packet with unknown ver/type")
             return
-        payload = frame[self.eth_header.size:]
+        payload = self.buf_mem[self.eth_header.size:]
         if len(payload) < payload_length:
             self.log.debug("payload in discovery frame is shorter than "
                            "declared length")
@@ -372,11 +377,11 @@ class AC:
                 "Received PADT for unknown session %s", hex(session_id))
 
     def read_session(self, mask: int) -> None:
-        frame = self.s_session.recv(2048)
-        if len(frame) < self.eth_header.size:
+        framelen = self.s_session.recv_into(self.buf)
+        if framelen < self.eth_header.size:
             return
         dest, src, etype, vt, code, session_id, payload_length \
-            = self.eth_header.unpack(frame[:self.eth_header.size])
+            = self.eth_header.unpack_from(self.buf)
         dest = MacAddr(dest)
         src = MacAddr(src)
         if etype != PPPOE_SESSION:
@@ -388,14 +393,14 @@ class AC:
         if code != 0:
             self.log.debug("Session packet with non-zero code")
             return
-        payload = frame[self.eth_header.size:]
+        payload = self.buf_mem[self.eth_header.size:]
         if len(payload) < payload_length:
             self.log.debug("payload in session frame is shorter than "
                            "declared length")
             return
         payload = payload[:payload_length]
         if session_id in self.sessions:
-            self.sessions[session_id].process_session_payload(payload)
+            self.sessions[session_id].process_session_payload(payload.tobytes())
         else:
             self.log.info("Sending PADT to %s for unknown session %s",
                           macaddr_to_str(src), hex(session_id))
