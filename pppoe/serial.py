@@ -6,11 +6,12 @@ import serial  # type: ignore
 import os
 import logging
 import selectors
-from typing import Final, Generator, Optional
+from typing import Final, Generator, Optional, Callable
 
-ppp_flag_sequence: Final = bytes.fromhex('7e')
+ppp_flag_byte: Final = 0x7e
+ppp_escape_code: Final = 0x7d
 ppp_hdlc_header: Final = bytes.fromhex('ff 03')
-ppp_bytes_to_stuff: Final = {0x7d, 0x7e}
+ppp_bytes_to_stuff: Final = {ppp_flag_byte, ppp_escape_code}
 
 
 # Algorithm from RFC1662 appendix C
@@ -23,39 +24,126 @@ def _gen_fcs16tab() -> Generator[int, None, None]:
 
 ppp_fcs16tab: Final = tuple(_gen_fcs16tab())
 
-
-def fcs16(data: bytes) -> bytes:
-    fcs = 0xffff
-    for b in data:
-        fcs = (fcs >> 8) ^ ppp_fcs16tab[(fcs ^ b) & 0xff]
-    fcs = fcs ^ 0xffff
-    return bytes((fcs & 0xff, fcs >> 8))
+FCS16_INIT: Final = 0xffff
+FCS16_GOOD: Final = 0xf0b8
 
 
-def ppp_stuff(data: bytes) -> Generator[int, None, None]:
-    i = iter(data)
-    try:
-        while True:
-            b = next(i)
+class ppp_stuff:
+    """Take raw ppp frames from pppoe payloads and process for serial
+
+    Frame, checksum and bytestuff raw frames for transmission to the
+    modem
+    """
+    def __init__(self, buf: memoryview):
+        self.buf = buf
+
+    def process(self, input: memoryview) -> int:
+        i = 0
+        fcs = FCS16_INIT
+        buf = self.buf
+
+        def stuff(b: int) -> None:
+            nonlocal i
             if b in ppp_bytes_to_stuff:
-                yield 0x7d
-                yield b ^ 0x20
+                buf[i] = ppp_escape_code
+                i += 1
+                buf[i] = b ^ 0x20
+                i += 1
             else:
-                yield b
-    except StopIteration:
-        pass
+                buf[i] = b
+                i += 1
+
+        def fcs16(b: int) -> None:
+            nonlocal fcs
+            fcs = (fcs >> 8) ^ ppp_fcs16tab[(fcs ^ b) & 0xff]
+
+        buf[i] = ppp_flag_byte
+        i += 1
+        for b in ppp_hdlc_header:
+            fcs16(b)
+            stuff(b)
+        for b in input:
+            fcs16(b)
+            stuff(b)
+        fcs = fcs ^ FCS16_INIT
+        for b in (fcs & 0xff, fcs >> 8):
+            stuff(b)
+        buf[i] = ppp_flag_byte
+        i += 1
+        return i
 
 
-def ppp_unstuff(data: bytes) -> Generator[int, None, None]:
-    i = iter(data)
-    try:
-        while True:
-            b = next(i)
-            if b == 0x7d:
-                b = next(i) ^ 0x20
-            yield b
-    except StopIteration:
-        pass
+class ppp_unstuff:
+    """Take data from the modem and process into raw ppp frames
+
+    Raw frames are assembled into output_memory, and send_frame() is
+    called whenever a complete frame is present
+    """
+    def __init__(self, output_memory: memoryview,
+                 send_frame: Callable[[int], None],
+                 log: logging.Logger):
+        self.in_frame = False
+        self.out = output_memory
+        self.send_frame = send_frame
+        self.log = log
+
+    def start_new_frame(self) -> None:
+        self.in_frame = True
+        self.hdlc_header_bytes_checked = 0
+        self.in_escape = False
+        self.frame_size = 0
+        self.fcs = FCS16_INIT
+
+    def process_byte(self, b: int) -> None:
+        if self.in_frame:
+            if b == ppp_flag_byte:
+                if self.in_escape:
+                    # This is illegal; dump the frame
+                    self.log.debug("Frame from modem ended with escape code")
+                    self.in_frame = False
+                    return
+                # We've reached the end of the frame. Send it if it's
+                # legal!
+                if self.frame_size < 4:
+                    # Empty frame; ignore
+                    pass
+                else:
+                    if self.fcs == FCS16_GOOD:
+                        self.send_frame(self.frame_size - 2)
+                    else:
+                        self.log.debug("Invalid FCS received from modem, "
+                                       "fcs=%s, len=%d",
+                                       hex(self.fcs), self.frame_size)
+                self.start_new_frame()
+                return
+            if self.in_escape:
+                b = b ^ 0x20
+                self.in_escape = False
+            else:
+                if b == ppp_escape_code:
+                    self.in_escape = True
+                    return
+            self.fcs = (self.fcs >> 8) ^ ppp_fcs16tab[(self.fcs ^ b) & 0xff]
+            if self.hdlc_header_bytes_checked < len(ppp_hdlc_header):
+                if b == ppp_hdlc_header[self.hdlc_header_bytes_checked]:
+                    self.hdlc_header_bytes_checked += 1
+                else:
+                    self.log.debug("Bad frame header from modem")
+                    self.in_frame = False
+                return
+            if self.frame_size >= len(self.out):
+                self.log.debug("Frame from modem is too long")
+                self.in_frame = False
+            else:
+                self.out[self.frame_size] = b
+                self.frame_size += 1
+        else:
+            if b == ppp_flag_byte:
+                self.start_new_frame()
+
+    def process(self, data: bytes) -> None:
+        for i in data:
+            self.process_byte(i)
 
 
 class SerialService(Service):
@@ -65,6 +153,12 @@ class SerialService(Service):
         self.port = port
         self.chatscript = chatscript
         self._f: Optional[serial.Serial] = None
+        # Buffer and memory view for traffic from ethernet to the modem
+        self.outbuf = bytearray(4096)
+        self.outbuf_memory = memoryview(self.outbuf)
+        # Buffer for frame being prepared for sending to ethernet
+        self.inbuf = bytearray(2048)
+        self.inbuf_memory: Optional[memoryview] = None
 
     def connect(self, ac: AC, peer: MacAddr, session_id: int) -> None:
         super().connect(ac, peer, session_id)
@@ -88,27 +182,27 @@ class SerialService(Service):
                 self.disconnect()
                 raise ServiceFailure(
                     f"Chatscript failed with return code {rc.returncode}")
-        self._partial_frame: Optional[bytes] = None
+        self.ppp_stuff = ppp_stuff(self.outbuf_memory)
+        self.ppp_unstuff = ppp_unstuff(
+            ac.prepare_send_session(self.inbuf), self.send_frame, self.log)
 
     def disconnect(self) -> None:
         super().disconnect()
+        del self.ppp_stuff, self.ppp_unstuff
         if self._f:
             self.sel.unregister(self._f)
             self._f.close()
         self._f = None
 
-    def process_session_payload(self, payload: bytes) -> None:
+    def process_session_payload(self, payload: memoryview) -> None:
         assert self._f
-        frame = ppp_hdlc_header + payload
-        frame = frame + fcs16(frame)
-        frame = bytes(ppp_stuff(frame))
-        frame = ppp_flag_sequence + frame + ppp_flag_sequence
+        size = self.ppp_stuff.process(payload)
         # serial.Serial.write() appears to busy-wait until it can
         # write to the device, which is particularly unhelpful because
         # it pegs the CPU at 100%. Let's use os.write() on the fd
         # instead.
         try:
-            os.write(self._f.fileno(), frame)
+            os.write(self._f.fileno(), self.outbuf_memory[:size])
         except BlockingIOError:
             # Should we keep a statistics counter for this?
             pass
@@ -117,11 +211,19 @@ class SerialService(Service):
         # The behaviour of serial.Serial.read() is very unhelpful when
         # the device has been disconnected: it raises SerialException
         # when os.read() returns no data, and then raises _another_
-        # SerialException while handling the first one, which we can't
-        # catch here.
+        # SerialException while internally handling the first one,
+        # which we can't catch here.
         #
         # Let's call os.read() on the fd ourselves and save a whole
         # lot of trouble!
+        #
+        # A serial.Serial.readinto() would be lovely, but it's
+        # currently implemented with an internal serial.Serial.read()
+        # and yet another copy and also has the exception issue
+        # described above.
+        #
+        # (os.readinto() would be lovely too, but doesn't exist. Grr.)
+
         assert self._f and self.ac and self.peer and self.session_id
         rawdata = os.read(self._f.fileno(), 4096)
         if not rawdata:
@@ -131,41 +233,10 @@ class SerialService(Service):
                                   error_message="Modem disconnected")
             self.disconnect()
             return
-        data = rawdata.split(ppp_flag_sequence)
+        self.ppp_unstuff.process(rawdata)
 
-        # If self._partial_frame is None, we have not yet received a
-        # flag sequence and so should discard the first segment
-        if self._partial_frame is None:
-            data.pop(0)
-            if data:
-                self._partial_frame = b''
-            else:
-                return  # No more data to process, still no flag sequence
-
-        # If there is a partial frame stored from a previous read, add
-        # it on to the first segment of data.
-        data[0] = self._partial_frame + data[0]
-
-        # If there is any data in the last segment it may be a partial
-        # frame, because the data we read didn't end with a flag
-        # sequence.  Remove and store the last segment for the next
-        # read.
-        self._partial_frame = data.pop(-1)
-
-        # Any segments containing data should be ppp frames
-        for s in data:
-            if len(s) > 0:
-                self.process_frame_from_modem(s)
-
-    def process_frame_from_modem(self, frame: bytes) -> None:
-        frame = bytes(ppp_unstuff(frame))
-        fcs = fcs16(frame[:-2])
-        if fcs != frame[-2:]:
-            self.log.warning("FCS error: frame=%s", frame.hex())
-            return
-        if frame[:2] != ppp_hdlc_header:
-            self.log.warning("HDLC header not as expected: frame=%s",
-                             frame.hex())
-            return
-        assert self.ac and self.peer and self.session_id
-        self.ac.send_session(self.peer, self.session_id, frame[2:-2])
+    def send_frame(self, frame_size: int) -> None:
+        # Callback from ppp_unstuff
+        assert self.ac and self.peer and self.session_id and self.inbuf
+        self.ac.send_session(self.peer, self.session_id,
+                             self.inbuf, frame_size)

@@ -152,7 +152,7 @@ class Service:
         self.peer = None
         self.state = ServiceState.IDLE
 
-    def process_session_payload(self, payload: bytes) -> None:
+    def process_session_payload(self, payload: memoryview) -> None:
         pass
 
     def __str__(self) -> str:
@@ -393,27 +393,49 @@ class AC:
         if code != 0:
             self.log.debug("Session packet with non-zero code")
             return
-        payload = self.buf_mem[self.eth_header.size:]
-        if len(payload) < payload_length:
+        if self.eth_header.size + payload_length > framelen:
             self.log.debug("payload in session frame is shorter than "
                            "declared length")
             return
-        payload = payload[:payload_length]
+        payload = self.buf_mem[
+            self.eth_header.size:self.eth_header.size + payload_length]
         if session_id in self.sessions:
-            self.sessions[session_id].process_session_payload(payload.tobytes())
+            self.sessions[session_id].process_session_payload(payload)
         else:
             self.log.info("Sending PADT to %s for unknown session %s",
                           macaddr_to_str(src), hex(session_id))
             self.send_discovery(src, CODE_PADT, session_id=session_id)
 
+    # In order to reduce the number of copies made while transferring
+    # data from a service to the client, services are expected to
+    # provide their own buffer for packets being sent. To send a frame
+    # to a client:
+    #
+    # During service init:
+    # buffer = bytearray(2048)
+    #
+    # During service connect:
+    # payload = ac.prepare_send_session(buffer)
+    #
+    # For each frame:
+    # ... fill in the payload and work out how big it is...
+    # ac.send_session(peer, session_id, buffer, payload_length)
+
+    def prepare_send_session(self, buffer: bytearray) -> memoryview:
+        # Return a memoryview suitable for filling in the payload
+        # in the provided buffer
+        return memoryview(buffer)[self.eth_header.size:]
+
     def send_session(self, peer: MacAddr, session_id: int,
-                     payload: bytes) -> None:
-        if len(payload) > self.mtu:
+                     buffer: bytearray, payload_length: int) -> None:
+        if payload_length > self.mtu:
             return
-        frame = b''.join((self.eth_header.pack(
+        self.eth_header.pack_into(
+            buffer, 0,
             peer, self.mac, PPPOE_SESSION, VERTYPE, 0,
-            session_id, len(payload)), payload))
-        self.s_session.send(frame)
+            session_id, payload_length)
+        self.s_session.send(memoryview(buffer)[
+            :self.eth_header.size + payload_length])
 
     def close_session(self, peer: MacAddr, session_id: int,
                       error_message: Optional[str] = None) -> None:
