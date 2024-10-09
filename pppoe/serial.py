@@ -2,7 +2,7 @@
 
 from .ac import MacAddr, Service, ServiceFailure, AC
 import subprocess
-import serial  # type: ignore
+import serial
 import os
 import logging
 import selectors
@@ -176,7 +176,7 @@ class SerialService(Service):
             os.set_blocking(self._f.fileno(), True)
             rc = subprocess.run(
                 ["/usr/sbin/chat", "-v", "-f", self.chatscript],
-                stdin=self._f, stdout=self._f)
+                stdin=self._f.fileno(), stdout=self._f.fileno())
             os.set_blocking(self._f.fileno(), False)
             if rc.returncode != 0:
                 self.disconnect()
